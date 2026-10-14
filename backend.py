@@ -1,11 +1,15 @@
+import json
+import os
+import shutil
+import uuid
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import shutil
-import os
 
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.tools import tool
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
@@ -38,18 +42,26 @@ state = {"agent": None, "vectorstore": None}
 def build_agent_from_vectorstore(vectorstore):
     retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-    def search_pdf(query: str) -> str:
+    # content  -> LLM ko jata hai (answer banane ke liye)
+    # artifact -> sirf hamari application ke paas rehta hai (citations ke liye)
+    @tool(response_format="content_and_artifact")
+    def search_pdf(query: str):
         """Search the uploaded PDF document for relevant information to answer
         the user's question. Always use this tool for any question about the
         document's content."""
         retrieved_docs = retriever.invoke(query)
         if not retrieved_docs:
-            return "No relevant information found in the document."
-        results = []
+            return "No relevant information found in the document.", []
+
+        content_parts = []
+        sources = []
         for doc in retrieved_docs:
-            page_num = doc.metadata.get("page", "unknown")
-            results.append(f"[Page {page_num}]: {doc.page_content}")
-        return "\n\n".join(results)
+            # PyPDFLoader page numbers 0-indexed hote hain, user ko 1-indexed dikhao
+            page = doc.metadata.get("page", 0) + 1
+            content_parts.append(f"[Page {page}]: {doc.page_content}")
+            sources.append({"page": page, "snippet": doc.page_content[:200]})
+
+        return "\n\n".join(content_parts), sources
 
     return create_agent(
         model=llm,
@@ -76,6 +88,29 @@ class UploadResponse(BaseModel):
     chunks_created: int
 
 
+# --- Streaming helpers ---
+def sse_line(payload: dict) -> str:
+    """Ek NDJSON event: ek JSON object, ek line."""
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def collect_sources(agent, config) -> list:
+    """Sirf current question ke tool calls ke sources nikalta hai."""
+    messages = agent.get_state(config).values["messages"]
+    sources = []
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            break  # yahan se purane questions shuru ho jate hain
+        if isinstance(msg, ToolMessage) and msg.artifact:
+            sources.extend(msg.artifact)
+
+    # Same page dobara aaye toh ek hi baar rakho, page order mein
+    unique = {}
+    for s in sources:
+        unique.setdefault(s["page"], s)
+    return sorted(unique.values(), key=lambda s: s["page"])
+
+
 # --- Endpoint 1: PDF Upload ---
 @app.post("/upload-pdf", response_model=UploadResponse)
 def upload_pdf(file: UploadFile = File(...)):
@@ -94,10 +129,12 @@ def upload_pdf(file: UploadFile = File(...)):
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
     chunks = splitter.split_documents(documents)
 
+    # Har upload ka apna unique collection, taaki purane PDF ke chunks mix na hon
+    # (warna citations mein galat document ke pages aa sakte hain)
     vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
-        collection_name="uploaded_doc",
+        collection_name=f"doc_{uuid.uuid4().hex}",
     )
 
     # Naya agent banao is vectorstore ke saath, aur global state update karo
@@ -110,7 +147,7 @@ def upload_pdf(file: UploadFile = File(...)):
     )
 
 
-# --- Endpoint 2: Chat (streaming) ---
+# --- Endpoint 2: Chat (streaming NDJSON: token / sources / error events) ---
 @app.post("/chat")
 def chat(request: ChatRequest):
     if state["agent"] is None:
@@ -119,15 +156,30 @@ def chat(request: ChatRequest):
             detail="No PDF uploaded yet. Please upload a PDF first.",
         )
 
+    # Local variable: stream ke beech mein naya PDF upload ho jaye toh bhi
+    # is request ke liye same agent use hota rahe
+    agent = state["agent"]
     config = {"configurable": {"thread_id": request.thread_id}}
 
-    def generate_chunks():
-        for message_chunk, _metadata in state["agent"].stream(
-            {"messages": [{"role": "user", "content": request.message}]},
-            config=config,
-            stream_mode="messages",
-        ):
-            if isinstance(message_chunk, AIMessageChunk) and message_chunk.content:
-                yield message_chunk.content
+    def generate():
+        try:
+            for chunk, _metadata in agent.stream(
+                {"messages": [{"role": "user", "content": request.message}]},
+                config=config,
+                stream_mode="messages",
+            ):
+                if (
+                    isinstance(chunk, AIMessageChunk)
+                    and isinstance(chunk.content, str)
+                    and chunk.content
+                ):
+                    yield sse_line({"type": "token", "content": chunk.content})
 
-    return StreamingResponse(generate_chunks(), media_type="text/plain")
+            # Answer khatam hone ke baad sources bhejo
+            sources = collect_sources(agent, config)
+            if sources:
+                yield sse_line({"type": "sources", "sources": sources})
+        except Exception as e:
+            yield sse_line({"type": "error", "message": str(e)})
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
